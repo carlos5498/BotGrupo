@@ -93,6 +93,25 @@ admin_sesion = {"activo": False, "paso": None}
 # los mande uno por uno seguido, no solo cuando los selecciona juntos.
 media_buffer = {}
 
+# Cache en memoria de la lista de usuarios aceptados. Sin esto, CADA mensaje
+# de CADA usuario dispara una consulta a Mongo que bloquea todo el bot mientras
+# responde (pymongo es síncrono) -- con pocos usuarios no se nota, pero con
+# cientos empieza a sentirse todo más lento. Se refresca sola cada CACHE_TTL
+# segundos, y se puede forzar su refresco con invalidar_cache_aceptados().
+CACHE_TTL_ACEPTADOS = 3
+_cache_aceptados = {"ids": [], "actualizado": 0.0}
+
+
+def _consultar_aceptados_mongo():
+    return [u["_id"] for u in col_usuarios.find(
+        {"estado": "aceptado", "baneado": {"$ne": True}, "multimedia_activo": {"$ne": False}},
+        {"_id": 1},
+    )]
+
+
+def invalidar_cache_aceptados():
+    _cache_aceptados["actualizado"] = 0.0
+
 # ---------------------------------------------------------------
 # HELPERS DE CONFIG / USUARIOS (Mongo)
 # ---------------------------------------------------------------
@@ -142,22 +161,22 @@ def aceptar_usuario(user_id):
         }},
         upsert=True,
     )
+    invalidar_cache_aceptados()
 
 
-def contar_aceptados():
-    # Solo cuentan (para el límite) los que están aceptados Y activos por su meta de multimedia.
-    # Los inactivos por no cumplir su meta liberan su lugar para alguien más.
-    return col_usuarios.count_documents({
-        "estado": "aceptado", "baneado": {"$ne": True}, "multimedia_activo": {"$ne": False},
-    })
+async def contar_aceptados():
+    return len(await obtener_aceptados())
 
 
-def obtener_aceptados(excluir=None):
-    # Destinatarios del reenvío: mismos criterios que contar_aceptados (los inactivos no reciben nada).
-    ids = [u["_id"] for u in col_usuarios.find(
-        {"estado": "aceptado", "baneado": {"$ne": True}, "multimedia_activo": {"$ne": False}},
-        {"_id": 1},
-    )]
+async def obtener_aceptados(excluir=None):
+    # Destinatarios del reenvío: mismos criterios de siempre (los inactivos no reciben nada),
+    # pero leídos de un cache en memoria en vez de golpear Mongo en cada mensaje.
+    ahora = time.monotonic()
+    if ahora - _cache_aceptados["actualizado"] > CACHE_TTL_ACEPTADOS:
+        ids = await asyncio.to_thread(_consultar_aceptados_mongo)
+        _cache_aceptados["ids"] = ids
+        _cache_aceptados["actualizado"] = ahora
+    ids = list(_cache_aceptados["ids"])
     if excluir is not None and excluir in ids:
         ids.remove(excluir)
     return ids
@@ -177,6 +196,7 @@ def registrar_multimedia(user_id, cantidad=1):
         set_usuario_campo(user_id, "multimedia_activo", True)
         set_usuario_campo(user_id, "multimedia_contador", 0)
         set_usuario_campo(user_id, "multimedia_ventana_inicio", datetime.utcnow())
+        invalidar_cache_aceptados()
 
 
 async def revisar_metas_multimedia(context):
@@ -187,13 +207,18 @@ async def revisar_metas_multimedia(context):
     if not meta:
         return
     ahora = datetime.utcnow()
+    hubo_cambios = False
     for u in col_usuarios.find({"estado": "aceptado", "baneado": {"$ne": True}}):
         inicio = u.get("multimedia_ventana_inicio") or ahora
         if ahora - inicio >= VENTANA_MULTIMEDIA:
             cumplio = u.get("multimedia_contador", 0) >= meta
             set_usuario_campo(u["_id"], "multimedia_activo", cumplio)
             set_usuario_campo(u["_id"], "multimedia_contador", 0)
+            hubo_cambios = True
             set_usuario_campo(u["_id"], "multimedia_ventana_inicio", ahora)
+
+    if hubo_cambios:
+        invalidar_cache_aceptados()
 
 
 def obtener_nombre(user):
@@ -320,10 +345,14 @@ async def worker_envio(app):
                     # Álbum: Telegram devuelve un mensaje por cada foto/video.
                     # Registramos TODOS bajo el mismo logical_id, así responder
                     # a cualquiera de ellos (no solo al primero) funciona igual.
+                    # Se hace en segundo plano (sin esperar) para no frenar el
+                    # envío al siguiente destinatario -- con cientos de usuarios,
+                    # esperar cada una de estas escrituras aquí era lo que hacía
+                    # que todo el bot se sintiera lento.
                     for m in enviado:
-                        registrar_entrega(logical_id, chat_id, m.message_id)
+                        asyncio.create_task(asyncio.to_thread(registrar_entrega, logical_id, chat_id, m.message_id))
                 else:
-                    registrar_entrega(logical_id, chat_id, enviado.message_id)
+                    asyncio.create_task(asyncio.to_thread(registrar_entrega, logical_id, chat_id, enviado.message_id))
         except Forbidden:
             # El usuario bloqueó al bot: dejamos de intentar mandarle (no lo baneamos, solo lo marcamos)
             set_usuario_campo(chat_id, "bloqueo_bot", True)
@@ -333,9 +362,9 @@ async def worker_envio(app):
             cola_envio.task_done()
 
 
-def encolar_para_todos(tipo, payload, excluir_id, logical_id=None, entregas_respuesta=None):
+async def encolar_para_todos(tipo, payload, excluir_id, logical_id=None, entregas_respuesta=None):
     entregas_respuesta = entregas_respuesta or {}
-    for chat_id in obtener_aceptados(excluir=excluir_id):
+    for chat_id in await obtener_aceptados(excluir=excluir_id):
         reply_to = entregas_respuesta.get(str(chat_id))
         cola_envio.put_nowait((chat_id, tipo, payload, reply_to, logical_id))
 
@@ -360,7 +389,7 @@ async def avanzar_onboarding(update, context, conf):
     user_id = update.effective_user.id
     msg = update.effective_message
 
-    if contar_aceptados() >= conf["limite_usuarios"]:
+    if await contar_aceptados() >= conf["limite_usuarios"]:
         await msg.reply_text("🚫 Se alcanzó el límite máximo de usuarios. Intenta más tarde.")
         return
 
@@ -480,7 +509,7 @@ async def _flush_media_buffer(context: ContextTypes.DEFAULT_TYPE):
         m = mensajes[0]
         tipo = "photo" if m.photo else "video"
         file_id = m.photo[-1].file_id if m.photo else m.video.file_id
-        encolar_para_todos(tipo, {"file_id": file_id, "caption": caption},
+        await encolar_para_todos(tipo, {"file_id": file_id, "caption": caption},
                             user_id, logical_id, entregas_respuesta)
         return
 
@@ -499,11 +528,11 @@ async def _flush_media_buffer(context: ContextTypes.DEFAULT_TYPE):
                 m = bloque[0]
                 tipo = "photo" if m.photo else "video"
                 file_id = m.photo[-1].file_id if m.photo else m.video.file_id
-                encolar_para_todos(tipo, {"file_id": file_id, "caption": cap_bloque or formatear_caption(nombre, None)},
+                await encolar_para_todos(tipo, {"file_id": file_id, "caption": cap_bloque or formatear_caption(nombre, None)},
                                     user_id, logical_id, entregas_respuesta)
             continue
 
-        encolar_para_todos("album", media_list, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("album", media_list, user_id, logical_id, entregas_respuesta)
 
 
 async def manejar_mensaje(update, context):
@@ -547,7 +576,7 @@ async def manejar_mensaje(update, context):
                 "nombre": nombre,
             }
         media_buffer[user_id]["mensajes"].append(msg)
-        registrar_entrega(media_buffer[user_id]["logical_id"], chat_id, msg.message_id)
+        await asyncio.to_thread(registrar_entrega, media_buffer[user_id]["logical_id"], chat_id, msg.message_id)
 
         # Si ya se juntaron 10 (máximo de Telegram por álbum), se manda de inmediato
         for job in context.job_queue.get_jobs_by_name(f"media_{user_id}"):
@@ -567,28 +596,28 @@ async def manejar_mensaje(update, context):
     logical_resp = buscar_logical_id(chat_id, msg.reply_to_message.message_id) if msg.reply_to_message else None
     entregas_respuesta = obtener_entregas(logical_resp)
     logical_id = crear_logical_id()
-    registrar_entrega(logical_id, chat_id, msg.message_id)
+    await asyncio.to_thread(registrar_entrega, logical_id, chat_id, msg.message_id)
 
     if msg.document:
-        encolar_para_todos("document", {"file_id": msg.document.file_id, "caption": formatear_caption(nombre, texto)},
+        await encolar_para_todos("document", {"file_id": msg.document.file_id, "caption": formatear_caption(nombre, texto)},
                             user_id, logical_id, entregas_respuesta)
     elif msg.audio:
-        encolar_para_todos("audio", {"file_id": msg.audio.file_id, "caption": formatear_caption(nombre, texto)},
+        await encolar_para_todos("audio", {"file_id": msg.audio.file_id, "caption": formatear_caption(nombre, texto)},
                             user_id, logical_id, entregas_respuesta)
     elif msg.animation:
-        encolar_para_todos("animation", {"file_id": msg.animation.file_id, "caption": formatear_caption(nombre, texto)},
+        await encolar_para_todos("animation", {"file_id": msg.animation.file_id, "caption": formatear_caption(nombre, texto)},
                             user_id, logical_id, entregas_respuesta)
     elif msg.voice:
-        encolar_para_todos("voice", {"file_id": msg.voice.file_id, "caption": formatear_caption(nombre, texto)},
+        await encolar_para_todos("voice", {"file_id": msg.voice.file_id, "caption": formatear_caption(nombre, texto)},
                             user_id, logical_id, entregas_respuesta)
     elif msg.video_note:
-        encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
-        encolar_para_todos("video_note", {"file_id": msg.video_note.file_id}, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("video_note", {"file_id": msg.video_note.file_id}, user_id, logical_id, entregas_respuesta)
     elif msg.sticker:
-        encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
-        encolar_para_todos("sticker", {"file_id": msg.sticker.file_id}, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("sticker", {"file_id": msg.sticker.file_id}, user_id, logical_id, entregas_respuesta)
     elif msg.text:
-        encolar_para_todos("text", formatear_caption(nombre, msg.text), user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, msg.text), user_id, logical_id, entregas_respuesta)
 
 
 async def cmd_aportes(update, context):
@@ -646,8 +675,8 @@ def teclado_admin(conf):
     ])
 
 
-def texto_panel(conf):
-    total = contar_aceptados()
+async def texto_panel(conf):
+    total = await contar_aceptados()
     meta = conf.get("meta_multimedia", 0)
     return (
         "🛠️ *Panel de Administrador*\n\n"
@@ -664,7 +693,7 @@ async def cmd_admin_on(update, context):
     admin_sesion["activo"] = True
     admin_sesion["paso"] = None
     conf = get_config()
-    await update.message.reply_text(texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
+    await update.message.reply_text(await texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
 
 
 async def cmd_admin_off(update, context):
@@ -694,7 +723,7 @@ async def cb_admin(update, context):
         nuevo = not conf.get("ignorar_enlaces")
         set_config_campo("ignorar_enlaces", nuevo)
         conf["ignorar_enlaces"] = nuevo
-        await query.edit_message_text(texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
+        await query.edit_message_text(await texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
     elif data == "adm_bienvenida":
         admin_sesion["paso"] = "bienvenida"
         await query.edit_message_text("✏️ Envía el nuevo mensaje de bienvenida.")
@@ -721,7 +750,7 @@ async def cb_admin(update, context):
             set_config_campo("grupo_requerido", chat_id)
             set_config_campo("grupo_requerido_nombre", g["titulo"] if g else str(chat_id))
         conf = get_config()
-        await query.edit_message_text(texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
+        await query.edit_message_text(await texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
     elif data == "adm_banear":
         admin_sesion["paso"] = "baneo"
         await query.edit_message_text("✏️ Envía las IDs a banear, una por línea.")
@@ -762,6 +791,8 @@ async def procesar_panel_admin(update, context):
         for uid in ids:
             set_usuario_campo(int(uid), "baneado", True)
             set_usuario_campo(int(uid), "estado", "baneado")
+        if ids:
+            invalidar_cache_aceptados()
         await msg.reply_text(f"✅ {len(ids)} usuario(s) baneado(s).")
     elif paso == "meta":
         if texto.isdigit():
@@ -776,7 +807,7 @@ async def procesar_panel_admin(update, context):
 
     admin_sesion["paso"] = None
     conf = get_config()
-    await msg.reply_text(texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
+    await msg.reply_text(await texto_panel(conf), parse_mode="Markdown", reply_markup=teclado_admin(conf))
 
 
 # ---------------------------------------------------------------
