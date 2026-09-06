@@ -48,7 +48,6 @@ import threading
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from bson import ObjectId
 from pymongo import MongoClient
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -56,7 +55,7 @@ from telegram import (
 )
 from telegram.request import HTTPXRequest
 from telegram.constants import ChatMemberStatus
-from telegram.error import Forbidden, BadRequest
+from telegram.error import Forbidden
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ChatMemberHandler, ContextTypes, filters,
@@ -80,8 +79,6 @@ db = client["grupo_anonimo_bot"]
 col_usuarios = db["usuarios"]
 col_config = db["config"]
 col_grupos = db["grupos"]
-col_mensajes = db["mensajes"]      # logical_id -> entregas {chat_id: message_id}
-col_replies = db["reply_map"]      # "chat_id_message_id" -> logical_id
 
 VENTANA_MULTIMEDIA = timedelta(days=2)
 
@@ -239,28 +236,6 @@ def formatear_caption(nombre, caption):
     return f"{nombre}:"
 
 
-# --- Hilo de respuestas: mapea qué message_id le llegó a cada quién ---
-def crear_logical_id():
-    return str(ObjectId())
-
-
-def buscar_logical_id(chat_id, message_id):
-    doc = col_replies.find_one({"_id": f"{chat_id}_{message_id}"})
-    return doc["logical_id"] if doc else None
-
-
-def registrar_entrega(logical_id, chat_id, message_id):
-    col_mensajes.update_one({"_id": logical_id}, {"$set": {f"entregas.{chat_id}": message_id}}, upsert=True)
-    col_replies.update_one({"_id": f"{chat_id}_{message_id}"}, {"$set": {"logical_id": logical_id}}, upsert=True)
-
-
-def obtener_entregas(logical_id):
-    if not logical_id:
-        return {}
-    doc = col_mensajes.find_one({"_id": logical_id})
-    return doc.get("entregas", {}) if doc else {}
-
-
 # ---------------------------------------------------------------
 # COLA DE ENVÍO CON RITMO ADAPTATIVO (respeta límites de Telegram)
 # ---------------------------------------------------------------
@@ -322,40 +297,15 @@ async def _enviar_por_tipo(app, chat_id, tipo, payload, kwargs):
     return None
 
 
-async def _enviar_uno(app, chat_id, tipo, payload, reply_to):
-    kwargs = {"reply_to_message_id": reply_to} if reply_to else {}
-    try:
-        return await _enviar_por_tipo(app, chat_id, tipo, payload, kwargs)
-    except BadRequest as e:
-        if reply_to and "repl" in str(e).lower():
-            # El mensaje original al que respondía ya no existe para ese usuario -> reintentar sin reply
-            kwargs.pop("reply_to_message_id", None)
-            return await _enviar_por_tipo(app, chat_id, tipo, payload, kwargs)
-        raise
-
-
 async def worker_envio(app):
     """Procesa la cola de reenvíos. Varias instancias de esta función corren en
     paralelo (ver NUM_WORKERS); el LimitadorTasa es quien realmente controla
     la velocidad total para no pasar el límite de Telegram."""
     while True:
-        chat_id, tipo, payload, reply_to, logical_id = await cola_envio.get()
+        chat_id, tipo, payload = await cola_envio.get()
         await limitador.acquire()
         try:
-            enviado = await _enviar_uno(app, chat_id, tipo, payload, reply_to)
-            if enviado is not None and logical_id:
-                if isinstance(enviado, list):
-                    # Álbum: Telegram devuelve un mensaje por cada foto/video.
-                    # Registramos TODOS bajo el mismo logical_id, así responder
-                    # a cualquiera de ellos (no solo al primero) funciona igual.
-                    # Se hace en segundo plano (sin esperar) para no frenar el
-                    # envío al siguiente destinatario -- con cientos de usuarios,
-                    # esperar cada una de estas escrituras aquí era lo que hacía
-                    # que todo el bot se sintiera lento.
-                    for m in enviado:
-                        asyncio.create_task(asyncio.to_thread(registrar_entrega, logical_id, chat_id, m.message_id))
-                else:
-                    asyncio.create_task(asyncio.to_thread(registrar_entrega, logical_id, chat_id, enviado.message_id))
+            await _enviar_por_tipo(app, chat_id, tipo, payload, {})
         except Forbidden:
             # El usuario bloqueó al bot: dejamos de intentar mandarle (no lo baneamos, solo lo marcamos)
             set_usuario_campo(chat_id, "bloqueo_bot", True)
@@ -365,11 +315,9 @@ async def worker_envio(app):
             cola_envio.task_done()
 
 
-async def encolar_para_todos(tipo, payload, excluir_id, logical_id=None, entregas_respuesta=None):
-    entregas_respuesta = entregas_respuesta or {}
+async def encolar_para_todos(tipo, payload, excluir_id):
     for chat_id in await obtener_aceptados(excluir=excluir_id):
-        reply_to = entregas_respuesta.get(str(chat_id))
-        cola_envio.put_nowait((chat_id, tipo, payload, reply_to, logical_id))
+        cola_envio.put_nowait((chat_id, tipo, payload))
 
 
 # ---------------------------------------------------------------
@@ -478,9 +426,6 @@ async def procesar_onboarding(update, context, usuario):
 # ---------------------------------------------------------------
 # REENVÍO DE MENSAJES ENTRE USUARIOS ACEPTADOS
 # ---------------------------------------------------------------
-# ---------------------------------------------------------------
-# REENVÍO DE MENSAJES ENTRE USUARIOS ACEPTADOS
-# ---------------------------------------------------------------
 def _armar_input_media(m, caption=None):
     if m.photo:
         return InputMediaPhoto(m.photo[-1].file_id, caption=caption)
@@ -497,8 +442,6 @@ async def _flush_media_buffer(context: ContextTypes.DEFAULT_TYPE):
 
     mensajes = sorted(info["mensajes"], key=lambda m: m.message_id)
     nombre = info["nombre"]
-    logical_id = info["logical_id"]
-    entregas_respuesta = info["entregas_respuesta"]
 
     caption_original = next((m.caption for m in mensajes if m.caption), None)
     if contiene_enlace(caption_original) and get_config().get("ignorar_enlaces"):
@@ -512,8 +455,7 @@ async def _flush_media_buffer(context: ContextTypes.DEFAULT_TYPE):
         m = mensajes[0]
         tipo = "photo" if m.photo else "video"
         file_id = m.photo[-1].file_id if m.photo else m.video.file_id
-        await encolar_para_todos(tipo, {"file_id": file_id, "caption": caption},
-                            user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos(tipo, {"file_id": file_id, "caption": caption}, user_id)
         return
 
     # Telegram permite máximo 10 elementos por álbum -> se parte en bloques si hace falta
@@ -531,11 +473,10 @@ async def _flush_media_buffer(context: ContextTypes.DEFAULT_TYPE):
                 m = bloque[0]
                 tipo = "photo" if m.photo else "video"
                 file_id = m.photo[-1].file_id if m.photo else m.video.file_id
-                await encolar_para_todos(tipo, {"file_id": file_id, "caption": cap_bloque or formatear_caption(nombre, None)},
-                                    user_id, logical_id, entregas_respuesta)
+                await encolar_para_todos(tipo, {"file_id": file_id, "caption": cap_bloque or formatear_caption(nombre, None)}, user_id)
             continue
 
-        await encolar_para_todos("album", media_list, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("album", media_list, user_id)
 
 
 async def manejar_mensaje(update, context):
@@ -571,15 +512,8 @@ async def manejar_mensaje(update, context):
             return
 
         if user_id not in media_buffer:
-            logical_resp = buscar_logical_id(chat_id, msg.reply_to_message.message_id) if msg.reply_to_message else None
-            media_buffer[user_id] = {
-                "mensajes": [],
-                "logical_id": crear_logical_id(),
-                "entregas_respuesta": obtener_entregas(logical_resp),
-                "nombre": nombre,
-            }
+            media_buffer[user_id] = {"mensajes": [], "nombre": nombre}
         media_buffer[user_id]["mensajes"].append(msg)
-        await asyncio.to_thread(registrar_entrega, media_buffer[user_id]["logical_id"], chat_id, msg.message_id)
 
         # Si ya se juntaron 10 (máximo de Telegram por álbum), se manda de inmediato
         for job in context.job_queue.get_jobs_by_name(f"media_{user_id}"):
@@ -596,31 +530,22 @@ async def manejar_mensaje(update, context):
     if contiene_enlace(texto) and conf.get("ignorar_enlaces"):
         return
 
-    logical_resp = buscar_logical_id(chat_id, msg.reply_to_message.message_id) if msg.reply_to_message else None
-    entregas_respuesta = obtener_entregas(logical_resp)
-    logical_id = crear_logical_id()
-    await asyncio.to_thread(registrar_entrega, logical_id, chat_id, msg.message_id)
-
     if msg.document:
-        await encolar_para_todos("document", {"file_id": msg.document.file_id, "caption": formatear_caption(nombre, texto)},
-                            user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("document", {"file_id": msg.document.file_id, "caption": formatear_caption(nombre, texto)}, user_id)
     elif msg.audio:
-        await encolar_para_todos("audio", {"file_id": msg.audio.file_id, "caption": formatear_caption(nombre, texto)},
-                            user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("audio", {"file_id": msg.audio.file_id, "caption": formatear_caption(nombre, texto)}, user_id)
     elif msg.animation:
-        await encolar_para_todos("animation", {"file_id": msg.animation.file_id, "caption": formatear_caption(nombre, texto)},
-                            user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("animation", {"file_id": msg.animation.file_id, "caption": formatear_caption(nombre, texto)}, user_id)
     elif msg.voice:
-        await encolar_para_todos("voice", {"file_id": msg.voice.file_id, "caption": formatear_caption(nombre, texto)},
-                            user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("voice", {"file_id": msg.voice.file_id, "caption": formatear_caption(nombre, texto)}, user_id)
     elif msg.video_note:
-        await encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
-        await encolar_para_todos("video_note", {"file_id": msg.video_note.file_id}, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, None), user_id)
+        await encolar_para_todos("video_note", {"file_id": msg.video_note.file_id}, user_id)
     elif msg.sticker:
-        await encolar_para_todos("text", formatear_caption(nombre, None), user_id, logical_id, entregas_respuesta)
-        await encolar_para_todos("sticker", {"file_id": msg.sticker.file_id}, user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, None), user_id)
+        await encolar_para_todos("sticker", {"file_id": msg.sticker.file_id}, user_id)
     elif msg.text:
-        await encolar_para_todos("text", formatear_caption(nombre, msg.text), user_id, logical_id, entregas_respuesta)
+        await encolar_para_todos("text", formatear_caption(nombre, msg.text), user_id)
 
 
 async def cmd_aportes(update, context):
