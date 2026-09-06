@@ -28,8 +28,10 @@ Notas de esta versión:
 - Los álbumes se agrupan por usuario (no por media_group_id de Telegram),
   así juntan fotos/videos aunque se manden uno por uno seguidos.
 - El envío usa varios workers en paralelo (NUM_WORKERS) limitados por un
-  "token bucket" global (TASA_MAXIMA msj/seg) para ir lo más rápido posible
-  sin pasar el límite de Telegram, sin importar cuántos usuarios haya.
+  "token bucket" global (TASA_MAXIMA msj/seg), con un pool de conexiones HTTP
+  del mismo tamaño (antes el default de la librería era 1 conexión, así que
+  aunque hubiera 20 "workers" en el código, a nivel de red se mandaba
+  prácticamente uno por uno).
 - Si se configura una "meta de multimedia" (panel admin), cada usuario debe
   mandar esa cantidad de fotos/videos cada 2 días o deja de RECIBIR mensajes
   de los demás (no se banea) y libera su lugar para otro usuario.
@@ -52,6 +54,7 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
 )
+from telegram.request import HTTPXRequest
 from telegram.constants import ChatMemberStatus
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
@@ -846,7 +849,11 @@ def keep_alive():
 def main():
     threading.Thread(target=keep_alive, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    request = HTTPXRequest(
+        connection_pool_size=NUM_WORKERS + 10,  # antes: 1 (default) -> todos los workers hacían fila igual
+        pool_timeout=20.0,
+    )
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler(CMD_ADMIN_ON, cmd_admin_on))
     app.add_handler(CommandHandler(CMD_ADMIN_OFF, cmd_admin_off))
