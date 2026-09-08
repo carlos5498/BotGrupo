@@ -21,44 +21,55 @@ Comandos especiales (SOLO funcionan si los envía OWNER_ID):
                       reenvían al grupo como cualquier otro usuario)
 
 Comando para cualquier usuario aceptado:
-  /aportes -> ve cuánta multimedia lleva enviada en la ventana actual de 2 días
+  /aportes -> ve cuánta multimedia lleva enviada en la ventana actual
+              (editable desde el panel admin, por defecto 1 día)
 
 Notas de esta versión:
 - El nombre del remitente siempre va en su propia línea, arriba del texto.
 - Los álbumes se agrupan por usuario (no por media_group_id de Telegram),
   así juntan fotos/videos aunque se manden uno por uno seguidos.
-- El envío usa varios workers en paralelo (NUM_WORKERS) limitados por un
-  "token bucket" global (TASA_MAXIMA msj/seg), con un pool de conexiones HTTP
-  del mismo tamaño (antes el default de la librería era 1 conexión, así que
-  aunque hubiera 20 "workers" en el código, a nivel de red se mandaba
-  prácticamente uno por uno).
+- Si respondes a un mensaje (texto u otro tipo) de otro usuario, el reenvío
+  también se manda como respuesta al mensaje correspondiente en el chat de
+  cada destinatario (se guarda un mapeo en memoria de las últimas
+  transmisiones para poder ubicar el mensaje equivalente en cada chat).
 - Si se configura una "meta de multimedia" (panel admin), cada usuario debe
-  mandar esa cantidad de fotos/videos cada 2 días o deja de RECIBIR mensajes
-  de los demás (no se banea) y libera su lugar para otro usuario.
-- Si respondes a un mensaje de otro usuario, el reenvío también se manda
-  como respuesta al mensaje correspondiente en el chat de cada destinatario.
+  mandar esa cantidad de fotos/videos cada N días (configurable, por
+  defecto 1 día) o deja de RECIBIR mensajes de los demás (no se banea) y
+  libera su lugar para otro usuario. Se pueden marcar IDs como "excepción"
+  (panel admin, debajo de Banear) para que nunca se les exija esa meta.
 
-DIAGNÓSTICO DE LENTITUD (agregado en esta versión):
-- La cola de envío ahora tiene un tamaño MÁXIMO (COLA_MAX_SIZE). Si se llena
-  (porque entran mensajes más rápido de lo que TASA_MAXIMA permite repartir),
-  se descartan los envíos más VIEJOS para priorizar los recientes, en vez de
-  ir acumulando un atraso que solo crece.
-- Cada QUEUE_LOG_INTERVAL segundos se loguea el tamaño actual de la cola.
-  Si ves ese número creciendo sin bajar nunca a 0 durante varios minutos
-  seguidos, confirma que TASA_MAXIMA (actualmente 25 msj/seg) se quedó corta
-  para la cantidad de usuarios/actividad actual, y hay que subirla.
+ENVÍO (rediseñado en esta versión para ser más rápido y mantener el orden):
+- Hay una cola de envío POR CADA chat destino, cada una consumida por su
+  propia tarea. Esto garantiza que los mensajes le lleguen a cada usuario
+  en el mismo orden en que se generaron, y que un envío lento a un usuario
+  no bloquee el envío a los demás (con una sola cola compartida y varios
+  workers, un usuario con problemas de red podía atrasar a todos).
+- La velocidad TOTAL (sumando todos los chats) sigue limitada por un
+  "token bucket" global (TASA_MAXIMA msj/seg) para respetar el límite de
+  Telegram (~30 msj/seg a chats distintos), con un pool de conexiones HTTP
+  (POOL_CONEXIONES) para que esos envíos realmente viajen en paralelo por
+  la red.
+- Ya NO se descartan mensajes viejos si la cola crece: todo lo que entra
+  se termina enviando, en orden.
+- Cada QUEUE_LOG_INTERVAL segundos se loguea cuántos mensajes hay en total
+  esperando a ser enviados (sumando todas las colas). Si ese número no baja
+  nunca a 0 durante varios minutos seguidos, TASA_MAXIMA se quedó corta
+  para la cantidad de usuarios/actividad actual y hay que subirla.
+- La revisión periódica de metas de multimedia corre en un hilo aparte
+  (no bloquea el envío de mensajes mientras revisa a todos los usuarios) y
+  su frecuencia es configurable con REVISION_METAS_INTERVALO_SEG.
 """
 
 import os
-import re
 import time
 import logging
 import asyncio
 import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio,
