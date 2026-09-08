@@ -1,3 +1,2 @@
-python-telegram-bot[all]
-pymongo
-dnspython
+python-telegram-bot[job-queue]==21.*
+  pymongo
