@@ -1,9 +1,70 @@
+"""
+Bot de "grupo anónimo" vía Telegram.
+--------------------------------------------------------------
+Los usuarios aceptados escriben al bot en privado y el bot reenvía
+ese mensaje (texto o multimedia) a todos los demás usuarios aceptados,
+agregando el nombre de quien lo envió.
+
+REQUISITOS DE ENTORNO (variables de entorno en Render):
+  BOT_TOKEN   -> token de tu bot (de @BotFather)
+  MONGO_URI   -> connection string de MongoDB
+  OWNER_ID    -> tu ID numérico de Telegram (solo tú puedes abrir el panel admin)
+  PORT        -> opcional, puerto para el keep-alive HTTP (default 8080)
+
+REQUIREMENTS.TXT necesarios:
+  python-telegram-bot[job-queue]==21.*
+  pymongo
+
+Comandos especiales (SOLO funcionan si los envía OWNER_ID):
+  /Carlos13mar    -> activa el modo administrador (panel de ajustes)
+  /Carlos13mar02  -> vuelve al modo usuario normal (tus mensajes se
+                      reenvían al grupo como cualquier otro usuario)
+
+Comando para cualquier usuario aceptado:
+  /aportes -> ve cuánta multimedia lleva enviada en la ventana actual
+              (editable desde el panel admin, por defecto 1 día)
+
+Notas de esta versión:
+- El nombre del remitente siempre va en su propia línea, arriba del texto.
+- Los álbumes se agrupan por usuario (no por media_group_id de Telegram),
+  así juntan fotos/videos aunque se manden uno por uno seguidos.
+- Si respondes a un mensaje (texto u otro tipo) de otro usuario, el reenvío
+  también se manda como respuesta al mensaje correspondiente en el chat de
+  cada destinatario (se guarda un mapeo en memoria de las últimas
+  transmisiones para poder ubicar el mensaje equivalente en cada chat).
+- Si se configura una "meta de multimedia" (panel admin), cada usuario debe
+  mandar esa cantidad de fotos/videos cada N días (configurable, por
+  defecto 1 día) o deja de RECIBIR mensajes de los demás (no se banea) y
+  libera su lugar para otro usuario. Se pueden marcar IDs como "excepción"
+  (panel admin, debajo de Banear) para que nunca se les exija esa meta.
+
+ENVÍO (rediseñado en esta versión para ser más rápido y mantener el orden):
+- Hay una cola de envío POR CADA chat destino, cada una consumida por su
+  propia tarea. Esto garantiza que los mensajes le lleguen a cada usuario
+  en el mismo orden en que se generaron, y que un envío lento a un usuario
+  no bloquee el envío a los demás (con una sola cola compartida y varios
+  workers, un usuario con problemas de red podía atrasar a todos).
+- La velocidad TOTAL (sumando todos los chats) sigue limitada por un
+  "token bucket" global (TASA_MAXIMA msj/seg) para respetar el límite de
+  Telegram (~30 msj/seg a chats distintos), con un pool de conexiones HTTP
+  (POOL_CONEXIONES) para que esos envíos realmente viajen en paralelo por
+  la red.
+- Ya NO se descartan mensajes viejos si la cola crece: todo lo que entra
+  se termina enviando, en orden.
+- Cada QUEUE_LOG_INTERVAL segundos se loguea cuántos mensajes hay en total
+  esperando a ser enviados (sumando todas las colas). Si ese número no baja
+  nunca a 0 durante varios minutos seguidos, TASA_MAXIMA se quedó corta
+  para la cantidad de usuarios/actividad actual y hay que subirla.
+- La revisión periódica de metas de multimedia corre en un hilo aparte
+  (no bloquea el envío de mensajes mientras revisa a todos los usuarios) y
+  su frecuencia es configurable con REVISION_METAS_INTERVALO_SEG.
+"""
+
 import os
 import time
 import logging
 import asyncio
 import threading
-import re
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
