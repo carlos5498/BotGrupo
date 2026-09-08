@@ -1,2 +1,2 @@
-  python-telegram-bot[job-queue]==21.*
-  pymongo
+python-telegram-bot>=20.0
+pymongo
